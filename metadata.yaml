@@ -8,13 +8,12 @@ description: |
 summary: |
   Charm which interfaces with GitLab to provide access for FINOS Legend components.
 
-# requires:
-# TODO(aznashwan): add optional relation to GitLab charm here
-# gitlab:
-#   interface: gitlab?
-#   limit: 1
-#   optional: false
-#   scope: global
+requires:
+  gitlab:
+    interface: gitlab
+    limit: 1
+    optional: true
+    scope: global
 
 provides:
   legend-sdlc-gitlab:

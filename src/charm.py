@@ -5,6 +5,7 @@
 """Module defining a Charm providing GitLab integration for FINOS Legend."""
 
 import functools
+import json
 import logging
 import traceback
 
@@ -30,6 +31,7 @@ GITLAB_OPENID_DISCOVERY_URL_FORMAT = "%(base_url)s/.well-known/openid-configurat
 
 GITLAB_REQUIRED_SCOPES = ["api", "openid", "profile"]
 
+RELATION_NAME_GITLAB = "gitlab"
 RELATION_NAME_SDLC = "legend-sdlc-gitlab"
 RELATION_NAME_ENGINE = "legend-engine-gitlab"
 RELATION_NAME_STUDIO = "legend-studio-gitlab"
@@ -80,13 +82,13 @@ class LegendGitlabIntegratorCharm(charm.CharmBase):
         self.framework.observe(self.on.install, self._on_install)
         self.framework.observe(self.on.config_changed, self._on_config_changed)
 
-        # TODO(aznashwan): register eventual GitLab relation hooks:
-        # self.framework.observe(
-        #     self.on["gitlab"].relation_joined,
-        #     self._on_gitlab_relation_joined)
-        # self.framework.observe(
-        #     self.on["gitlab"].relation_changed,
-        #     self._on_gitlab_relation_changed)
+        # GitLab charm relation events:
+        self.framework.observe(
+            self.on[RELATION_NAME_GITLAB].relation_joined, self._on_gitlab_relation_joined
+        )
+        self.framework.observe(
+            self.on[RELATION_NAME_GITLAB].relation_changed, self._on_gitlab_relation_changed
+        )
 
         # Legend component relation events:
         self.framework.observe(
@@ -148,20 +150,39 @@ class LegendGitlabIntegratorCharm(charm.CharmBase):
 
         return scheme
 
-    def _get_gitlab_base_url(self):
-        return GITLAB_BASE_URL_FORMAT % {
-            "scheme": self._get_gitlab_scheme(),
+    def _get_gitlab_creds(self):
+        relation = self.model.get_relation(RELATION_NAME_GITLAB)
+        if relation:
+            rel_data = relation.data[relation.app]
+            data = json.loads(rel_data["credentials"])
+            # data will have the same fields as below.
+            return data
+
+        # Return a dictionary with the same fields as the ones given by the gitlab relation.
+        api_scheme = self._get_gitlab_scheme()
+        return {
             "host": self.model.config["gitlab-host"],
             "port": self.model.config["gitlab-port"],
+            "api-scheme": api_scheme,
+            "access-token": self.model.config.get("access-token"),
+        }
+
+    def _get_gitlab_base_url(self):
+        creds = self._get_gitlab_creds()
+        return GITLAB_BASE_URL_FORMAT % {
+            "scheme": creds["api-scheme"],
+            "host": creds["host"],
+            "port": creds["port"],
         }
 
     @property
     def _gitlab_client(self):
-        if not self.model.config.get("access-token"):
+        creds = self._get_gitlab_creds()
+        if not creds["access-token"]:
             return None
         return gitlab.Gitlab(
             self._get_gitlab_base_url(),
-            private_token=self.model.config["access-token"],
+            private_token=creds["access-token"],
             # NOTE(aznashwan): we skip SSL verification for GitLabs with self-signed certs:
             ssl_verify=False,
         )
@@ -185,6 +206,12 @@ class LegendGitlabIntegratorCharm(charm.CharmBase):
             self._stored.gitlab_client_secret = gitlab_client_secret
             return None
 
+        redirect_uris = self._get_legend_services_redirect_uris()
+        if not redirect_uris:
+            return model.BlockedStatus(
+                "cannot create gitlab app without all legend services related"
+            )
+
         # Check GitLab client available:
         gitlab_client = self._gitlab_client
         if not gitlab_client:
@@ -196,25 +223,24 @@ class LegendGitlabIntegratorCharm(charm.CharmBase):
             return existing_apps
 
         # Check app name is available:
-        app_name = self.model.config["application-name"]
+        # We're prefixing the gitlab application name with this charm's app name, so we know
+        # that we're the its creators. We need this to make sure we don't update any existing
+        # application that isn't related to us.
+        app_name = "%s - %s" % (self.app.name, self.model.config["application-name"])
+
+        # We need to update the Callback URIs if they've changed (e.g.: changed external-hostname)
         matches = [app for app in existing_apps if app.application_name == app_name]
         if matches:
-            return model.BlockedStatus(
-                "application with name '%s' already exists on GitLab, please review the charm "
-                "documentation on dealing with this" % (app_name)
-            )
-
-        redirect_uris = self._get_legend_services_redirect_uris()
-        if not redirect_uris:
-            return model.BlockedStatus(
-                "cannot create gitlab app without all legend services related"
-            )
+            app = matches[0]
+            if app.callback_url == redirect_uris:
+                # Nothing to do, the Callback URIs already match.
+                return
 
         # TODO(aznashwan): make app trusted by default:
         # https://github.com/finos/legend/blob/master/installers/docker-compose/legend/scripts/setup-gitlab.sh#L36-L42
         app = None
         app_properties = {
-            "name": self.model.config["application-name"],
+            "name": app_name,
             "scopes": " ".join(GITLAB_REQUIRED_SCOPES),
             "redirect_uri": redirect_uris,
         }
@@ -296,11 +322,12 @@ class LegendGitlabIntegratorCharm(charm.CharmBase):
         return None
 
     def _get_gitlab_host_cert_b64(self):
-        host = self.model.config["gitlab-host"]
-        port = self.model.config["gitlab-port"]
+        creds = self._get_gitlab_creds()
+        host = creds["host"]
+        port = creds["port"]
         if any([not param for param in [host, port]]):
             return model.BlockedStatus(
-                "both a 'gitlab-host' and 'gitlab-port' config options are required"
+                "both a 'gitlab-host' and 'gitlab-port' config options / relation data are required"
             )
 
         try:
@@ -315,10 +342,13 @@ class LegendGitlabIntegratorCharm(charm.CharmBase):
         if not all([self._stored.gitlab_client_id, self._stored.gitlab_client_secret]):
             return model.BlockedStatus("awaiting gitlab server configuration or relation")
 
-        scheme = self._get_gitlab_scheme()
+        creds = self._get_gitlab_creds()
+        host = creds["host"]
+        port = creds["port"]
+        scheme = creds["api-scheme"]
         rel_data = {
-            "gitlab_host": self.model.config["gitlab-host"],
-            "gitlab_port": self.model.config["gitlab-port"],
+            "gitlab_host": host,
+            "gitlab_port": port,
             "gitlab_scheme": scheme,
             "client_id": self._stored.gitlab_client_id,
             "client_secret": self._stored.gitlab_client_secret,
@@ -409,12 +439,10 @@ class LegendGitlabIntegratorCharm(charm.CharmBase):
         self._update_charm_status()
 
     def _on_gitlab_relation_joined(self, event: charm.RelationJoinedEvent):
-        # TODO(aznashwan): eventual GitLab operator relation:
         pass
 
     def _on_gitlab_relation_changed(self, event: charm.RelationChangedEvent) -> None:
-        # TODO(aznashwan): eventual GitLab operator relation:
-        pass
+        self._update_charm_status()
 
     def _on_legend_sdlc_gitlab_relation_joined(self, event: charm.RelationJoinedEvent) -> None:
         pass
